@@ -3,46 +3,44 @@ using namespace System.Net
 # Input bindings are passed in via param block.
 param($Request, $TriggerMetadata)
 
-function RegenerateCredential($credentialId, $providerAddress){
-    Write-Host "Regenerating credential. Id: $credentialId Resource Id: $providerAddress"
-    
-    $storageAccountName = ($providerAddress -split '/')[8]
-    $resourceGroupName = ($providerAddress -split '/')[4]
-    
-    #Regenerate key 
-    $operationResult = New-AzStorageAccountKey -ResourceGroupName $resourceGroupName -Name $storageAccountName -KeyName $credentialId
-    $newCredentialValue = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName|where KeyName -eq $credentialId).value 
-    return $newCredentialValue
+function GenerateSasToken($storageAccountName, $containerName, $validityPeriodDays){
+    # Import Azure Storage module
+    Import-Module Azure.Storage
+
+    # Define permissions for the SAS token
+    $sasTokenPermissions = @{
+        "Read" = $true
+        "Write" = $true
+        "List" = $true
+    }
+
+    # Define start and expiry times for the SAS token
+    $start = Get-Date
+    $expiry = $start.AddDays($validityPeriodDays)
+
+    # Create a new Shared Access Policy
+    $sasPolicy = New-AzStorageContainerSASToken -Context $storageAccountName.Context `
+        -ExpiryTime $expiry `
+        -StartTime $start `
+        -FullUri `
+        -Name $containerName `
+        -Permission $sasTokenPermissions
+
+    return $sasPolicy
 }
 
-function GetAlternateCredentialId($credentialId){
-   $validCredentialIdsRegEx = 'key[1-2]'
-   
-   If($credentialId -NotMatch $validCredentialIdsRegEx){
-       throw "Invalid credential id: $credentialId. Credential id must follow this pattern:$validCredentialIdsRegEx"
-   }
-   If($credentialId -eq 'key1'){
-       return "key2"
-   }
-   Else{
-       return "key1"
-   }
+function AddSecretToKeyVault($keyVaultName, $secretName, $secretValue, $expiryDate, $tags){
+    Set-AzKeyVaultSecret -VaultName $keyVaultName -Name $secretName -SecretValue $secretValue -Tag $tags -Expires $expiryDate
 }
 
-function AddSecretToKeyVault($keyVAultName,$secretName,$secretvalue,$exprityDate,$tags){
-    
-     Set-AzKeyVaultSecret -VaultName $keyVAultName -Name $secretName -SecretValue $secretvalue -Tag $tags -Expires $expiryDate
-
-}
-
-function RoatateSecret($keyVaultName,$secretName){
+function RoatateSecret($keyVaultName, $secretName){
     #Retrieve Secret
     $secret = (Get-AzKeyVaultSecret -VaultName $keyVAultName -Name $secretName)
     Write-Host "Secret Retrieved"
     
     #Retrieve Secret Info
     $validityPeriodDays = $secret.Tags["ValidityPeriodDays"]
-    $credentialId=  $secret.Tags["CredentialId"]
+    $credentialId =  $secret.Tags["CredentialId"]
     $providerAddress = $secret.Tags["ProviderAddress"]
     
     Write-Host "Secret Info Retrieved"
@@ -50,26 +48,31 @@ function RoatateSecret($keyVaultName,$secretName){
     Write-Host "Credential Id: $credentialId"
     Write-Host "Provider Address: $providerAddress"
 
-    #Get Credential Id to rotate - alternate credential
+    # Get Credential Id to rotate - alternate credential
     $alternateCredentialId = GetAlternateCredentialId $credentialId
     Write-Host "Alternate credential id: $alternateCredentialId"
 
-    #Regenerate alternate access credential in provider
-    $newCredentialValue = (RegenerateCredential $alternateCredentialId $providerAddress)
-    Write-Host "Credential regenerated. Credential Id: $alternateCredentialId Resource Id: $providerAddress"
+    # Regenerate alternate access SAS token
+    $storageAccountName = ($providerAddress -split '/')[8]
+    $containerName = "your_container_name"  # Replace with your actual container name
+    $newSasToken = GenerateSasToken -storageAccountName $storageAccountName -containerName $containerName -validityPeriodDays $validityPeriodDays
+    Write-Host "SAS Token regenerated for container '$containerName' with $validityPeriodDays days validity."
 
-    #Add new credential to Key Vault
-    $newSecretVersionTags = @{}
-    $newSecretVersionTags.ValidityPeriodDays = $validityPeriodDays
-    $newSecretVersionTags.CredentialId=$alternateCredentialId
-    $newSecretVersionTags.ProviderAddress = $providerAddress
+    # Add new SAS token to Key Vault
+    $newSecretVersionTags = @{
+        "ValidityPeriodDays" = $validityPeriodDays
+        "CredentialId" = $alternateCredentialId
+        "ProviderAddress" = $providerAddress
+    }
 
     $expiryDate = (Get-Date).AddDays([int]$validityPeriodDays).ToUniversalTime()
-    $secretvalue = ConvertTo-SecureString "$newCredentialValue" -AsPlainText -Force
-    AddSecretToKeyVault $keyVAultName $secretName $secretvalue $expiryDate $newSecretVersionTags
+    $secretValue = ConvertTo-SecureString "$newSasToken" -AsPlainText -Force
+    AddSecretToKeyVault $keyVAultName $secretName $secretValue $expiryDate $newSecretVersionTags
 
-    Write-Host "New credential added to Key Vault. Secret Name: $secretName"
+    Write-Host "New SAS token added to Key Vault. Secret Name: $secretName"
 }
+
+# Rest of the code remains the same...
 
 
 # Write to the Azure Functions log stream.
